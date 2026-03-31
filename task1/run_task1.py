@@ -109,6 +109,8 @@ def vectorize_corpus_sparse(
             )
         )
     return sparse_list
+
+
 def vectorize_corpus_to_csr(
     texts: List[str],
     num_features: int,
@@ -117,31 +119,23 @@ def vectorize_corpus_to_csr(
     desc: str,
 ) -> csr_matrix:
     data, indices, indptr = [], [], [0]
-    
+
     for text in tqdm(texts, desc=desc):
         # 复用你原来的分词和哈希逻辑
         feat_dict = hash_features_for_text(text, num_features, ngram_range, binary)
-        
+
         # 将字典转为稀疏格式需要的三个数组
         for col in sorted(feat_dict.keys()):
             indices.append(col)
             data.append(feat_dict[col])
         indptr.append(len(indices))
-    
-    # 构建 CSR 矩阵：这在内存中是连续存放的
-    return csr_matrix((data, indices, indptr), shape=(len(texts), num_features), dtype=np.float32)
 
-# def build_dense_batch(
-#     indices: np.ndarray,
-#     sparse_features: List[Dict[int, float]],
-#     num_features: int,
-#     device: torch.device,
-# ) -> torch.Tensor:
-#     x = torch.zeros((len(indices), num_features), dtype=torch.float32, device=device)
-#     for row, sample_idx in enumerate(indices):
-#         for col, val in sparse_features[int(sample_idx)].items():
-#             x[row, col] = val
-#     return x
+    # 构建 CSR 矩阵：这在内存中是连续存放的
+    return csr_matrix(
+        (data, indices, indptr), shape=(len(texts), num_features), dtype=np.float32
+    )
+
+
 def build_dense_batch(
     indices: np.ndarray,
     sparse_matrix: csr_matrix,
@@ -150,10 +144,11 @@ def build_dense_batch(
 ) -> torch.Tensor:
     # 1. 利用 scipy 高效切片并转为密集 NumPy 数组
     # 这是 C 级别的操作，比 Python 循环快几百倍
-    batch_data = sparse_matrix[indices].toarray() 
-    
+    batch_data = sparse_matrix[indices].toarray()
+
     # 2. 一次性转为 Tensor 并移动到 GPU
     return torch.from_numpy(batch_data).to(device)
+
 
 def linear_forward(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return x @ w + b
@@ -173,7 +168,9 @@ def mse_on_softmax_manual(
     shifted = logits - logits.max(dim=1, keepdim=True).values
     probs = torch.exp(shifted)
     probs = probs / probs.sum(dim=1, keepdim=True)
-    one_hot = torch.zeros((logits.shape[0], num_classes), dtype=logits.dtype, device=logits.device)
+    one_hot = torch.zeros(
+        (logits.shape[0], num_classes), dtype=logits.dtype, device=logits.device
+    )
     one_hot[torch.arange(logits.shape[0], device=logits.device), targets] = 1.0
     return ((probs - one_hot) ** 2).mean()
 
@@ -186,7 +183,7 @@ def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
 def evaluate_model(
     indices: np.ndarray,
     labels: np.ndarray,
-    sparse_features: List[Dict[int, float]],
+    sparse_features: csr_matrix,
     num_features: int,
     batch_size: int,
     device: torch.device,
@@ -224,7 +221,7 @@ def evaluate_model(
 
 def predict_labels(
     indices: np.ndarray,
-    sparse_features: List[Dict[int, float]],
+    sparse_features: csr_matrix,
     num_features: int,
     batch_size: int,
     device: torch.device,
@@ -263,7 +260,9 @@ def plot_histories(results: List[dict], out_dir: Path) -> None:
     plt.figure(figsize=(10, 6))
     for r in results:
         plt.plot(r["history"]["train_loss"], label=f"{r['config']['name']}-train")
-        plt.plot(r["history"]["val_loss"], linestyle="--", label=f"{r['config']['name']}-val")
+        plt.plot(
+            r["history"]["val_loss"], linestyle="--", label=f"{r['config']['name']}-val"
+        )
     plt.title("Train/Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
@@ -283,7 +282,9 @@ def train_one_experiment(
     num_classes: int,
     device: torch.device,
 ) -> dict:
-    w = (0.01 * torch.randn(cfg.num_features, num_classes, device=device)).requires_grad_(True)
+    w = (
+        0.01 * torch.randn(cfg.num_features, num_classes, device=device)
+    ).requires_grad_(True)
     b = torch.zeros(num_classes, dtype=torch.float32, device=device, requires_grad=True)
 
     history = {"train_loss": [], "val_loss": [], "val_acc": []}
@@ -368,9 +369,11 @@ def build_default_experiments(
     batch_size: int,
     num_features: int,
 ) -> List[ExperimentConfig]:
+    """8 组最小可行实验矩阵（控制变量法）"""
     return [
+        # 1. Baseline: BoW + CE + lr0.10 + count + wd1e-4
         ExperimentConfig(
-            name="bow_ce_lr0.10",
+            name="baseline_bow_ce_lr0.10",
             ngram_min=1,
             ngram_max=1,
             loss_type="ce",
@@ -381,20 +384,9 @@ def build_default_experiments(
             weight_decay=1e-4,
             binary=False,
         ),
+        # 2. +bigram: N-gram(1,2) 效果
         ExperimentConfig(
-            name="bow_ce_lr0.05",
-            ngram_min=1,
-            ngram_max=1,
-            loss_type="ce",
-            lr=0.05,
-            epochs=epochs,
-            batch_size=batch_size,
-            num_features=num_features,
-            weight_decay=1e-4,
-            binary=False,
-        ),
-        ExperimentConfig(
-            name="ngram12_ce_lr0.10",
+            name="bigram_ce_lr0.10",
             ngram_min=1,
             ngram_max=2,
             loss_type="ce",
@@ -405,8 +397,9 @@ def build_default_experiments(
             weight_decay=1e-4,
             binary=False,
         ),
+        # 3. +trigram: N-gram(1,3) 效果
         ExperimentConfig(
-            name="ngram13_ce_lr0.10",
+            name="trigram_ce_lr0.10",
             ngram_min=1,
             ngram_max=3,
             loss_type="ce",
@@ -417,22 +410,11 @@ def build_default_experiments(
             weight_decay=1e-4,
             binary=False,
         ),
+        # 4. +mse: 损失函数对比
         ExperimentConfig(
-            name="ngram14_ce_lr0.10",
+            name="bow_mse_lr0.10",
             ngram_min=1,
-            ngram_max=4,
-            loss_type="ce",
-            lr=0.10,
-            epochs=epochs,
-            batch_size=batch_size,
-            num_features=num_features,
-            weight_decay=1e-4,
-            binary=False,
-        ),
-        ExperimentConfig(
-            name="ngram12_mse_lr0.10",
-            ngram_min=1,
-            ngram_max=2,
+            ngram_max=1,
             loss_type="mse",
             lr=0.10,
             epochs=epochs,
@@ -441,11 +423,65 @@ def build_default_experiments(
             weight_decay=1e-4,
             binary=False,
         ),
+        # 5. +lr_small: 小学习率
+        ExperimentConfig(
+            name="bow_ce_lr0.01",
+            ngram_min=1,
+            ngram_max=1,
+            loss_type="ce",
+            lr=0.01,
+            epochs=epochs,
+            batch_size=batch_size,
+            num_features=num_features,
+            weight_decay=1e-4,
+            binary=False,
+        ),
+        # 6. +lr_large: 大学习率
+        ExperimentConfig(
+            name="bow_ce_lr0.30",
+            ngram_min=1,
+            ngram_max=1,
+            loss_type="ce",
+            lr=0.30,
+            epochs=epochs,
+            batch_size=batch_size,
+            num_features=num_features,
+            weight_decay=1e-4,
+            binary=False,
+        ),
+        # 7. +binary: 二值特征
+        ExperimentConfig(
+            name="bow_ce_lr0.10_binary",
+            ngram_min=1,
+            ngram_max=1,
+            loss_type="ce",
+            lr=0.10,
+            epochs=epochs,
+            batch_size=batch_size,
+            num_features=num_features,
+            weight_decay=1e-4,
+            binary=True,
+        ),
+        # 8. +no_reg: 无正则化
+        ExperimentConfig(
+            name="bow_ce_lr0.10_no_reg",
+            ngram_min=1,
+            ngram_max=1,
+            loss_type="ce",
+            lr=0.10,
+            epochs=epochs,
+            batch_size=batch_size,
+            num_features=num_features,
+            weight_decay=0,
+            binary=False,
+        ),
     ]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Task1: text classification without torch.nn")
+    parser = argparse.ArgumentParser(
+        description="Task1: text classification without torch.nn"
+    )
     parser.add_argument("--train_path", type=str, default="../new_train.tsv")
     parser.add_argument("--test_path", type=str, default="../new_test.tsv")
     parser.add_argument("--out_dir", type=str, default="outputs")
@@ -454,7 +490,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_features", type=int, default=100000)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--device", type=str, default="auto", choices=["auto", "cpu", "cuda"]
+    )
     return parser.parse_args()
 
 
@@ -560,29 +598,10 @@ def main() -> None:
 
         all_results.append(result)
 
-    # best = max(all_results, key=lambda x: x["best_val_acc"])
-    # print(f"Best experiment: {best['config']['name']} | val_acc={best['best_val_acc']:.4f}")
-
-    # best_cfg = best["config"]
-    # best_cache_key = (
-    #     best_cfg["ngram_min"],
-    #     best_cfg["ngram_max"],
-    #     best_cfg["num_features"],
-    #     best_cfg["binary"],
-    # )
-    # _, best_sparse_test = feature_cache[best_cache_key]
-    # test_indices = np.arange(len(test_texts))
-    # preds = predict_labels(
-    #     indices=test_indices,
-    #     sparse_features=best_sparse_test,
-    #     num_features=best_cfg["num_features"],
-    #     batch_size=best_cfg["batch_size"],
-    #     device=device,
-    #     w=best["best_w"],
-    #     b=best["best_b"],
-    # )
     best = max(all_results, key=lambda x: x["best_val_acc"])
-    print(f"Best experiment: {best['config']['name']} | val_acc={best['best_val_acc']:.4f}")
+    print(
+        f"Best experiment: {best['config']['name']} | val_acc={best['best_val_acc']:.4f}"
+    )
     best_cfg = best["config"]
     best_cache_key = (
         best_cfg["ngram_min"],
@@ -604,7 +623,6 @@ def main() -> None:
     )
     save_predictions(out_dir / "predictions_best.csv", preds)
 
-    # ↓ 新增：这里才是规范的最终测试集评估
     _, final_test_acc = evaluate_model(
         indices=test_indices,
         labels=test_labels,
