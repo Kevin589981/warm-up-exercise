@@ -373,19 +373,21 @@ def run_single_experiment(exp, args, device_str):
     print(f"[{exp['name']}] Generating data...")
     train_gen = make_train_gen(exp["train_config"])
     test_gen = make_test_gen(exp["test_config"])
-    train_pairs = train_gen()
+    all_train_pairs = train_gen()
     test_pairs = test_gen()
-    print(f"[{exp['name']}] Train: {len(train_pairs)}, Test: {len(test_pairs)}")
+    print(
+        f"[{exp['name']}] Total train: {len(all_train_pairs)}, Test: {len(test_pairs)}"
+    )
 
-    vocab = build_vocab(train_pairs + test_pairs)
+    vocab = build_vocab(all_train_pairs + test_pairs)
     vocab_size = len(vocab)
     max_len = args.max_len
 
-    train_src, train_tgt = [], []
-    for src, tgt in train_pairs:
+    all_src, all_tgt = [], []
+    for src, tgt in all_train_pairs:
         s, t = encode_pair(src, tgt, vocab, max_len)
-        train_src.append(s)
-        train_tgt.append(t)
+        all_src.append(s)
+        all_tgt.append(t)
 
     test_src, test_tgt = [], []
     for src, tgt in test_pairs:
@@ -393,9 +395,21 @@ def run_single_experiment(exp, args, device_str):
         test_src.append(s)
         test_tgt.append(t)
 
-    train_src_t = torch.tensor(train_src, dtype=torch.long)
-    train_tgt_t = torch.tensor(train_tgt, dtype=torch.long)
+    all_src_t = torch.tensor(all_src, dtype=torch.long)
+    all_tgt_t = torch.tensor(all_tgt, dtype=torch.long)
     test_src_t = torch.tensor(test_src, dtype=torch.long)
+
+    n_val = max(1, int(len(all_train_pairs) * 0.1))
+    indices = torch.randperm(len(all_train_pairs))
+    val_idx = indices[:n_val]
+    train_idx = indices[n_val:]
+
+    train_src_t = all_src_t[train_idx]
+    train_tgt_t = all_tgt_t[train_idx]
+    val_src_t = all_src_t[val_idx]
+    val_tgt_t = all_tgt_t[val_idx]
+
+    val_pairs = [all_train_pairs[i] for i in val_idx.tolist()]
 
     train_dataset = Seq2SeqDataset(train_src_t, train_tgt_t)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -469,9 +483,9 @@ def run_single_experiment(exp, args, device_str):
         train_loss = total_loss / total_n
 
         correct = 0
-        sample_size = min(200, len(test_pairs))
-        for i in range(sample_size):
-            src_tensor = test_src_t[i : i + 1].to(device)
+        val_sample = min(200, len(val_pairs))
+        for i in range(val_sample):
+            src_tensor = val_src_t[i : i + 1].to(device)
             src_mask = make_pad_mask(src_tensor, 0)
             pred = greedy_decode(
                 model,
@@ -483,10 +497,10 @@ def run_single_experiment(exp, args, device_str):
                 pad_idx=0,
                 decoder_only=(exp["model_type"] == "decoder_only"),
             )
-            if pred == test_pairs[i][1]:
+            if pred == val_pairs[i][1]:
                 correct += 1
 
-        acc = correct / sample_size
+        acc = correct / val_sample
         history["train_loss"].append(train_loss)
         history["val_acc"].append(acc)
 
@@ -520,8 +534,8 @@ def run_single_experiment(exp, args, device_str):
 
     full_acc = correct / len(test_pairs)
     print(
-        f"[{exp['name']}] Done | best_acc={best_acc:.4f} "
-        f"full_acc={full_acc:.4f} ({len(test_pairs)} samples)"
+        f"[{exp['name']}] Done | val_acc={best_acc:.4f} "
+        f"test_acc={full_acc:.4f} ({len(test_pairs)} samples)"
     )
 
     return {
@@ -530,8 +544,8 @@ def run_single_experiment(exp, args, device_str):
             "desc": exp["desc"],
             "model_type": exp["model_type"],
         },
-        "best_acc": best_acc,
-        "full_test_acc": full_acc,
+        "best_val_acc": best_acc,
+        "test_acc": full_acc,
         "test_size": len(test_pairs),
         "history": history,
         "best_state": best_state,
@@ -541,6 +555,42 @@ def run_single_experiment(exp, args, device_str):
 # ============================================================
 # 主程序
 # ============================================================
+
+
+def make_train_gen(config):
+    def gen():
+        if config == "3plus3":
+            return generate_addition_pairs(8000, 3, 3)
+        elif config == "mixed":
+            return (
+                generate_addition_pairs(2000, 2, 2)
+                + generate_addition_pairs(3000, 3, 3)
+                + generate_addition_pairs(2000, 4, 4)
+                + generate_addition_pairs(1000, 5, 5)
+            )
+        return []
+
+    return gen
+
+
+def make_test_gen(config):
+    def gen():
+        if config == "3plus3":
+            return generate_addition_pairs(1000, 3, 3)
+        elif config == "4plus4":
+            return generate_addition_pairs(1000, 4, 4)
+        elif config == "5plus5":
+            return generate_addition_pairs(1000, 5, 5)
+        elif config == "mixed":
+            return (
+                generate_addition_pairs(500, 2, 2)
+                + generate_addition_pairs(500, 3, 3)
+                + generate_addition_pairs(500, 4, 4)
+                + generate_addition_pairs(500, 5, 5)
+            )
+        return []
+
+    return gen
 
 
 def main():
@@ -559,7 +609,7 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        default=0,
+        default=5,
         help="0 = sequential, >0 = multiprocessing with N workers",
     )
     args = parser.parse_args()
@@ -578,78 +628,43 @@ def main():
     out_dir = base_dir / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-def make_train_gen(config):
-    """Return a callable that generates training pairs for the given config."""
-    def gen():
-        if config == "3plus3":
-            return generate_addition_pairs(8000, 3, 3)
-        elif config == "mixed":
-            return (
-                generate_addition_pairs(2000, 2, 2)
-                + generate_addition_pairs(3000, 3, 3)
-                + generate_addition_pairs(2000, 4, 4)
-                + generate_addition_pairs(1000, 5, 5)
-            )
-        return []
-    return gen
-
-def make_test_gen(config):
-    """Return a callable that generates test pairs for the given config."""
-    def gen():
-        if config == "3plus3":
-            return generate_addition_pairs(1000, 3, 3)
-        elif config == "4plus4":
-            return generate_addition_pairs(1000, 4, 4)
-        elif config == "5plus5":
-            return generate_addition_pairs(1000, 5, 5)
-        elif config == "mixed":
-            return (
-                generate_addition_pairs(500, 2, 2)
-                + generate_addition_pairs(500, 3, 3)
-                + generate_addition_pairs(500, 4, 4)
-                + generate_addition_pairs(500, 5, 5)
-            )
-        return []
-    return gen
-
-
-experiments = [
-    {
-        "name": "baseline_3plus3",
-        "model_type": "enc_dec",
-        "train_config": "3plus3",
-        "test_config": "3plus3",
-        "desc": "3位数+3位数 同分布",
-    },
-    {
-        "name": "extrapolate_4plus4",
-        "model_type": "enc_dec",
-        "train_config": "3plus3",
-        "test_config": "4plus4",
-        "desc": "3位训练 → 4位测试 (外推)",
-    },
-    {
-        "name": "extrapolate_5plus5",
-        "model_type": "enc_dec",
-        "train_config": "3plus3",
-        "test_config": "5plus5",
-        "desc": "3位训练 → 5位测试 (外推)",
-    },
-    {
-        "name": "mixed_training",
-        "model_type": "enc_dec",
-        "train_config": "mixed",
-        "test_config": "mixed",
-        "desc": "混合长度训练",
-    },
-    {
-        "name": "decoder_only_3plus3",
-        "model_type": "decoder_only",
-        "train_config": "3plus3",
-        "test_config": "3plus3",
-        "desc": "Decoder-only 变体",
-    },
-]
+    experiments = [
+        {
+            "name": "baseline_3plus3",
+            "model_type": "enc_dec",
+            "train_config": "3plus3",
+            "test_config": "3plus3",
+            "desc": "3位数+3位数 同分布",
+        },
+        {
+            "name": "extrapolate_4plus4",
+            "model_type": "enc_dec",
+            "train_config": "3plus3",
+            "test_config": "4plus4",
+            "desc": "3位训练 → 4位测试 (外推)",
+        },
+        {
+            "name": "extrapolate_5plus5",
+            "model_type": "enc_dec",
+            "train_config": "3plus3",
+            "test_config": "5plus5",
+            "desc": "3位训练 → 5位测试 (外推)",
+        },
+        {
+            "name": "mixed_training",
+            "model_type": "enc_dec",
+            "train_config": "mixed",
+            "test_config": "mixed",
+            "desc": "混合长度训练",
+        },
+        {
+            "name": "decoder_only_3plus3",
+            "model_type": "decoder_only",
+            "train_config": "3plus3",
+            "test_config": "3plus3",
+            "desc": "Decoder-only 变体",
+        },
+    ]
 
     if args.workers > 1:
         import multiprocessing as mp
@@ -665,10 +680,10 @@ experiments = [
 
     all_results = results
 
-    best_overall = max(all_results, key=lambda x: x["full_test_acc"])
+    best_overall = max(all_results, key=lambda x: x["test_acc"])
     print(
         f"\nBest overall: {best_overall['config']['name']} | "
-        f"acc={best_overall['full_test_acc']:.4f}"
+        f"val_acc={best_overall['best_val_acc']:.4f} test_acc={best_overall['test_acc']:.4f}"
     )
 
     with open(out_dir / "metrics_summary.json", "w", encoding="utf-8") as f:
@@ -706,19 +721,34 @@ experiments = [
     plt.close()
 
     names = [r["config"]["name"] for r in all_results]
-    best_accs = [r["best_acc"] for r in all_results]
-    full_accs = [r["full_test_acc"] for r in all_results]
+    best_val_accs = [r["best_val_acc"] for r in all_results]
+    test_accs = [r["test_acc"] for r in all_results]
 
     x_pos = np.arange(len(names))
     width = 0.35
     fig, ax = plt.subplots(figsize=(14, 5))
     ax.bar(
         x_pos - width / 2,
-        best_accs,
+        best_val_accs,
         width,
-        label="Best Acc (200 samples)",
+        label="Best Val Acc (200 samples)",
         color="steelblue",
     )
-    ax.bar(x_pos + width / 2, full_accs, width, label="Full Test Acc", color="coral")
+    ax.bar(x_pos + width / 2, test_accs, width, label="Full Test Acc", color="coral")
     ax.set_xticks(x_pos)
-    ax.
+    ax.set_xticklabels(names, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Addition Task — Accuracy Comparison")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "bar_comparison.png", dpi=180)
+    plt.close()
+
+    torch.save(best_overall["best_state"], out_dir / "best_model.pt")
+
+    print(f"\nSaved outputs to: {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
