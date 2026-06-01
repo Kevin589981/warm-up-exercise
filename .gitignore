@@ -1,0 +1,7 @@
+*.zip
+test.md
+*.6B
+*.pt
+**/__pycache__/
+**/outputs**
+sentiment-analysis-on-movie-reviews
