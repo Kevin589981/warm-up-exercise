@@ -1,0 +1,8 @@
+*.zip
+test.md
+*.6B
+
+# 大于 1MB 的文件不纳入版本控制
+sentiment-analysis-on-movie-reviews/train.tsv/
+sentiment-analysis-on-movie-reviews/test.tsv/
+task2/outputs/best_model.pt
